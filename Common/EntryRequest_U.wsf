@@ -1,0 +1,910 @@
+<job id="EntryRequest_U">
+    <object id="objFS" progid="Scripting.FileSystemObject" />
+    <script language="VBScript" src="Constants.vbs" />
+    <script language="VBScript" src="RegionConstants.vbs" />
+    <script language="VBScript" src="Message.vbs" />
+    <script language="VBScript" src="Logger.vbs" />
+    <script Language="JavaScript" />
+    <script language="VBScript">
+
+'******************************************************************************
+' EntryRequest_U.wsf 
+'
+' Description  : Common script to open application request screen and check if request is completed.
+'                Created for US to add sending request email feature to IBM standard script.
+'
+'******************************************************************************
+
+    Dim objEntryRequestLogger
+    Dim objPkgInfo
+    Dim strLogLevel
+    Dim intReturnCode
+    Dim result
+    Dim argAppName
+    Dim argLogPath
+
+    '------------------------------------------------------------------------------------------
+    ' Get arguments (arg1: application name, arg2: log file path)
+    '------------------------------------------------------------------------------------------
+    if Wscript.Arguments.Count = 2 then
+        argAppName = Wscript.Arguments(0)
+        argLogPath = Wscript.Arguments(1) & "\" & argAppName & "_" & ENTRY_REQUEST_LOG
+    Else
+        WScript.Quit(ERRNO_ENTRY_REQUEST_FAILED)
+    End if
+
+    '--------------------------------------------------------------------------
+    ' Create Logger object associated with SetupWsf.log
+    ' and set it as current Logger
+    '--------------------------------------------------------------------------
+    strLogLevel = LOG_LEVEL_INFO
+
+    Set objEntryRequestLogger = GetLogger(argLogPath)
+    objEntryRequestLogger.LogLevel = strLogLevel
+    SetCurrentLogger(objEntryRequestLogger)
+
+    objEntryRequestLogger.Info(FormatMessage(SART_SCRIPT, Array(WScript.ScriptName)))
+
+    objEntryRequestLogger.Info(FormatMessage(SCRIPT_PARAMETERS, Array(WScript.ScriptName)))    
+    objEntryRequestLogger.Info("------------------------------")
+    objEntryRequestLogger.Info(FormatMessage(SCRIPT_PARAMETER_FORMAT, Array(argAppName)))
+    objEntryRequestLogger.Info("------------------------------")
+
+'--------------------------------------------------------------------------
+' Call installation request input screen 
+'--------------------------------------------------------------------------
+objEntryRequestLogger.Info(ENTRY_REQUEST_START)
+    
+  If Not OpenEntryRequest(Wscript.Arguments(0)) Then
+      objEntryRequestLogger.Error(ENTRY_REQUEST_FAILED)
+'      Call MsgBox(_
+'        ENTRY_REQUEST_FAILED_MESSAGE_1 & vbNewLine & _
+'        ENTRY_REQUEST_FAILED_MESSAGE_2, _
+'        vbOKOnly + vbInformation + vbSystemModal, _
+'        ENTRY_REQUEST_FAILED_MESSAGE_3 _
+'        )
+      WScript.Quit(ERRNO_ENTRY_REQUEST_FAILED)
+  End If
+
+objEntryRequestLogger.Info(ENTRY_REQUEST_END)
+
+'*************************************************************************
+' Function Id  : OpenEntryRequest
+'
+' Parameter    : Package name
+'
+' Return Value : N/A
+'
+' Description  : Open Application request screen 
+'                and monitor the status until sending request email
+'
+'*************************************************************************
+Function OpenEntryRequest(pkgName)
+    On Error Resume Next
+    
+    If IS_PASSWORD_ENTER = False Then
+      OpenEntryRequest =OpenEntryRequestWindow(pkgName)
+    Else
+      OpenEntryRequest = OpenEntryRequestWithPass(pkgName)
+    End If
+
+    If err.number <> 0 Then
+      OpenEntryRequest = False
+    End If
+
+End Function
+
+'*************************************************************************
+' Function Id  : OpenEntryRequestWindow
+'
+' Parameter    : Package name (Software name)
+'
+' Return Value : N/A
+'
+' Description  : Open Application request screen
+'                and monitor the status until sending request email
+'
+'*************************************************************************
+Function OpenEntryRequestWindow(pkgName)
+    On Error Resume Next
+    Dim loopcnt
+    Dim objIE, strRet, Stream, postData, strHeaders, param
+    Set objIE = GetObject("new:{D5E8041D-920F-45e9-B8FB-B1DEB82C6E5E}")
+    Dim user, software, groupcode
+    
+    user = GetUser()
+    software = encodeURI(pkgName)
+    groupcode = GetGroupCode()
+
+    postData = StringToBinary("user=" + user + "&software=" + software + "&groupcode=" + groupcode + "&itype=0")
+    strHeaders = "Content-Type: application/x-www-form-urlencoded"
+
+    objIE.Navigate ENTRY_REQUEST_URL, Nothing, Nothing, postData, strHeaders
+    objIE.Width = 1350
+    objIE.Height = 650
+    objIE.Visible = True
+    loopcnt = 0
+
+    Wait objIE, loopcnt
+
+    param = objIE.Document.getElementById("watch").value
+    
+    Do Until param = "sccuess"
+      Wait objIE, loopcnt
+      WScript.sleep(MONITORING_TIME)
+      param = objIE.Document.getElementById("watch").value
+      loopcnt = loopcnt + CInt(MONITORING_TIME)
+      If (err.number <> 0 And objIE.Busy = false And objIE.readyState = 4) Or loopcnt > MAXLOOPCNT Then
+          Exit Do
+      End If
+    Loop
+    
+    If loopcnt > MAXLOOPCNT And Not param = "sccuess" Then
+        objIE.Quit
+        Set objIE = Nothing
+        Call MsgBox(_
+            TIMEOUT_MESSAGE_1, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            TIMEOUT_MESSAGE_2 _
+       )
+        OpenEntryRequestWindow = False
+    ElseIf err.number <> 0 And Not param = "sccuess" Then
+        objIE.Quit
+        Set objIE = Nothing
+        OpenEntryRequestWindow = False
+    Else
+        WScript.sleep(CLOSE_TIME)
+        objIE.Quit
+        Set objIE = Nothing
+        OpenEntryRequestWindow = True
+    End If
+End Function
+
+'*************************************************************************
+' Function Id  : OpenEntryRequestWithPass
+'
+' Parameter    : Package name (Software name)
+'
+' Return Value : N/A
+'
+' Description  : Input password and
+'                open Application request screen as the user
+'
+'*************************************************************************
+Function OpenEntryRequestWithPass(pkgName)
+    On Error Resume Next
+    Dim objLogger
+    Dim user, sessionId
+    Dim objShell
+    Dim strCmd, strPassword, strCmd2
+    Dim runasResult, inputCount
+    Dim objEnv
+    Dim strSysRoot
+      
+    Set objLogger = GetCurrentLogger
+    user = GetUser()
+    sessionId = GetSessionId(UCase(user))
+  
+    Set objLogger = GetCurrentLogger
+
+    Set objEnv = objWshShell.Environment("Process")
+    strSysRoot = objEnv.Item("SYSTEMROOT")
+ 
+    Set objEnv = Nothing
+
+    Set objShell = CreateObject("Wscript.Shell")
+    strCmd       = strSysRoot & "\system32\wscript.exe //Nologo " & SCRIPT_FOLDER & "\" & ENTRY_REQUEST_SCRIPT & _
+                   " /" & ARG_NAME_PKG_DIST_ROOT & ":" & WScript.Arguments.Named(ARG_NAME_PKG_DIST_ROOT) & _
+                   " /" & ARG_NAME_PKG_NM & ":" & WScript.Arguments.Named(ARG_NAME_PKG_NM) & _
+                   " /" & ARG_NAME_PKG_VER & ":" & WScript.Arguments.Named(ARG_NAME_PKG_VER) & _
+                   " /" & ARG_NAME_LOG_LEVEL & ":" & WScript.Arguments.Named(ARG_NAME_LOG_LEVEL)
+    
+    runasResult = 2
+    inputCount = 1
+    
+    objLogger.Info(ENTRY_REQUEST_WITH_PASS_START)
+    objLogger.Info(FormatMessage(ENTRY_REQUEST_EXEC_CMDLINE, Array(strCmd)))
+    objLogger.Info(FormatMessage(ENTRY_REQUEST_EXEC_USER, Array(user)))
+   
+    Do Until runasResult = 0
+        If inputCount > PASSWORD_RETRY_COUNT Then
+            objLogger.Error(FormatMessage(PASSWORD_RETRY_ERROR, Array(PASSWORD_RETRY_COUNT)))
+            Call MsgBox(_
+                FormatMessage(PASSWORD_RETRY_ERROR, Array(PASSWORD_RETRY_COUNT)) & vbNewLine & _
+                ENTRY_REQUEST_INTTERRUPUTION , _
+                vbOKOnly + vbInformation + vbSystemModal, _
+                ERROR_TITLE _
+            )
+            OpenEntryRequestWithPass = False
+            Set objShell = Nothing
+            Set objLogger = Nothing
+            Exit Function
+        End If
+        
+        objLogger.Debug(CREATE_PASSWORD_FORM_START)
+        CreatePasswordForm user, inputCount
+        objLogger.Debug(CREATE_PASSWORD_FORM_END)
+        
+        objLogger.Debug(INPUT_PASSWORD_START)
+        Set objLogger = Nothing
+        strPassword = InputPassword
+        Set objLogger = GetCurrentLogger
+        objLogger.Debug(INPUT_PASSWORD_END)
+        
+        objLogger.Debug(FormatMessage (DELETE_TEMP_FILE_START, Array(PASSWORD_FORM_HTML)))
+
+        If Not DeleteTempFile(TEMP_FOLDER & "\" & PASSWORD_FORM_HTML) Then
+            objLogger.Error(FormatMessage(FILE_DELETE_ERROR, Array(PASSWORD_FORM_HTML)))
+            Call MsgBox(_
+                UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+                vbOKOnly + vbInformation + vbSystemModal, _
+                ERROR_TITLE _
+            )
+            OpenEntryRequestWithPass = False
+            Set objShell = Nothing
+            Set objLogger = Nothing
+            Exit Function
+        End If
+        objLogger.Debug(FormatMessage (DELETE_TEMP_FILE_END, Array(PASSWORD_FORM_HTML)))
+        
+        If strPassword = "" Then
+            OpenEntryRequestWithPass = False
+            Set objShell = Nothing
+            Set objLogger = Nothing
+            Exit Function
+        End If
+
+        strCmd = SCRIPT_FOLDER & "\" & PSEXEC & " -i " & sessionId & " -u " & DOMAIN_NAME & "\" & user & " -p " & strPassword & " -accepteula " & strCmd
+        runasResult = objShell.Run(strCmd, 0, TRUE)
+        inputCount = inputCount + 1
+    Loop
+    
+    Set objShell = Nothing
+    
+    objLogger.Debug(CHECK_RESULT_START)
+    Set objLogger = Nothing
+    OpenEntryRequestWithPass = CheckResult
+    Set objLogger = GetCurrentLogger
+    objLogger.Debug(CHECK_RESULT_END)
+
+    If err.number <> 0 Then
+        OpenEntryRequestWithPass = False
+        objLogger.Error(UNFORESEEN_ERROR)
+    End If
+
+    objLogger.Info(ENTRY_REQUEST_WITH_PASS_END)    
+    Set objLogger = Nothing
+    
+End Function
+
+'*************************************************************************
+' Function Id  : CreatePasswordForm
+'
+' Parameter    :Account name, Number of times entering password
+'
+' Return Value : HTML file
+'
+' Description  : Convert parameter texts into binary
+'
+'*************************************************************************
+Sub CreatePasswordForm(user, inputCount)
+    On Error Resume Next
+    Dim objFso, oTs
+    Dim message
+    
+    Set objFso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not objFso.FolderExists(TEMP_FOLDER) Then
+        objFso.CreateFolder(TEMP_FOLDER)
+    End If
+    
+    message = ""
+    If inputCount > 1 Then
+        message = "&nbsp;&nbsp;The password you entered is incorrect.Please tried again."
+    End If
+    
+    Set oTs = objFso.CreateTextFile(TEMP_FOLDER & "\" & PASSWORD_FORM_HTML,True)
+    oTs.WriteLine "<!-- saved from url=(0017)http://localhost/ -->"
+    oTs.WriteLine "<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Transitional//EN' 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd'>"
+    oTs.WriteLine "<html xmlns='http://www.w3.org/1999/xhtml'>"
+    oTs.WriteLine "<head><title>"
+    oTs.WriteLine "Password"
+    oTs.WriteLine "</title>"
+    oTs.WriteLine "</head>"
+    oTs.WriteLine "<body style='background-color: white;font-size: 10pt;line-height: 16pt;'>"
+    oTs.WriteLine "<script type='text/javascript'>"
+    oTs.WriteLine "//<![CDATA["
+    oTs.WriteLine "function doSubmit(){"
+    oTs.WriteLine "if (document.getElementById('userPass').value == '') {"
+    oTs.WriteLine "document.getElementById('error').innerHTML='&nbsp;&nbsp;Password cannot be blank. Please enter the password.';"
+    oTs.WriteLine "}"
+    oTs.WriteLine "else {"
+    oTs.WriteLine "document.getElementById('error').innerHTML='';"
+    oTs.WriteLine "document.getElementById('watch').value='OK';"
+    oTs.WriteLine "}"
+    oTs.WriteLine "return false;"
+    oTs.WriteLine "}"
+    oTs.WriteLine "function clickCancel() {"
+    oTs.WriteLine "document.getElementById('watch').value='Cancel';"
+    oTs.WriteLine "}"
+    oTs.WriteLine "//]]>"
+    oTs.WriteLine "<" & "/script>"
+    oTs.WriteLine "<form action='/password' method='POST' onsubmit='doSubmit();'>"
+    oTs.WriteLine "<div style='width: 100%'>"
+    oTs.WriteLine "<div>"
+    oTs.WriteLine "<span id='info' style='font-size: 13pt'>&nbsp;&nbsp;Please enter the Login password of the computer (Astellas account).</span>"
+    oTs.WriteLine "<br/>"
+    oTs.WriteLine "<span id='error' style='font-size: 13pt; color: red'>"
+    oTs.WriteLine message
+    oTs.WriteLine "</span>" 
+    oTs.WriteLine "</div>"
+    oTs.WriteLine "<div>"
+    oTs.WriteLine "<dl>"
+    oTs.WriteLine "<dt style='width :35%;float: left;text-align: right;'>"
+    oTs.WriteLine "AccountID :"
+    oTs.WriteLine "</dt>"
+    oTs.WriteLine "<dd style='text-align: left;'>&nbsp;"
+    oTs.WriteLine UCase(user)
+    oTs.WriteLine "</dd>"
+    oTs.WriteLine "</dl>"
+    oTs.WriteLine "<dl>"
+    oTs.WriteLine "<dt style='width :35%;float: left;text-align: right;'>"
+    oTs.WriteLine "Password :"
+    oTs.WriteLine "</dt>"
+    oTs.WriteLine "<dd style='width :75%;margin-left: 0px;'>"
+    oTs.WriteLine "<input name='userPass' type='password' id='userPass' style='width:200px;text-decoration:none;text-align: left;' />"
+    oTs.WriteLine "</dd>"
+    oTs.WriteLine "</dl>"
+    oTs.WriteLine "</div>"
+    oTs.WriteLine "</div>"
+    oTs.WriteLine "<hr style='clear:both' />"
+    oTs.WriteLine "<table>"
+    oTs.WriteLine "<td style='width:10%'>"
+    oTs.WriteLine "</td>"
+    oTs.WriteLine "<td style='width:50%;text-align:center;'>"
+    oTs.WriteLine "<input type='submit' name='ok' value='OK' id='ok' style='width:60px;background-color: dodgerblue;color: white;border: 1px solid dodgerblue;' />"
+    oTs.WriteLine "</td>"
+    oTs.WriteLine "<td style='width:5%'>"
+    oTs.WriteLine "<input type='button' name='cancel' value='Cancel' id='cancel' onClick='clickCancel()' style='background-color: dodgerblue;color: white;border: 1px solid dodgerblue;' />"
+    oTs.WriteLine "</td>"
+    oTs.WriteLine "</table>"
+    oTs.WriteLine "<input type='hidden' id='watch' value='none' />"
+    oTs.WriteLine "</form>"
+    oTs.WriteLine "</body>"
+    oTs.WriteLine "</html>"
+    oTs.Close
+    
+    set oTs=Nothing
+    Set objFso=Nothing
+End Sub
+
+'*************************************************************************
+' Function Id  : InputPassword
+'
+' Parameter    :
+'
+' Return Value : Password entered in the password form
+'
+' Description  : Display password form 
+'                and monitor the status until user finishs entering password
+'
+'*************************************************************************
+Function InputPassword()
+    On Error Resume Next
+    Dim loopcnt, param
+    Dim objIE
+    Dim objFso
+    Dim objLogger
+    
+    Set objLogger = GetCurrentLogger
+
+    InputPassw0rd = ""
+    Set objFso = CreateObject("Scripting.FileSystemObject")
+    If Not objFso.FileExists(TEMP_FOLDER & "\" & PASSWORD_FORM_HTML) Then
+        objFso = Nothing
+        objLogger.Error(FormatMessage(NO_EXISTS_ERROR, Array(PASSWORD_FORM_HTML)))
+        Call MsgBox(_
+            UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            ERROR_TITLE _
+        )
+        Exit Function
+    End If
+    
+    Set objIE = CreateObject("InternetExplorer.Application")
+    
+    objIE.Navigate TEMP_FOLDER & "\" & PASSWORD_FORM_HTML
+    objIE.Width = 600
+    objIE.Height = 260
+    objIE.AddressBar = False
+    objIE.MenuBar = False
+    objIE.ToolBar = False
+    
+    objIE.Visible = True
+    Call ActiveIE
+    loopcnt = 0
+
+    Wait objIE, loopcnt
+
+    param = objIE.Document.getElementById("watch").value
+
+    Do Until param = "OK"
+      Wait objIE, loopcnt
+      WScript.sleep(MONITORING_TIME)
+      param = objIE.Document.getElementById("watch").value
+      loopcnt = loopcnt + CInt(MONITORING_TIME)
+      If err.number <> 0 Or loopcnt > MAXLOOPCNT Or param = "Cancel" Then
+          Exit Do
+      End If
+    Loop
+
+    If param = "Cancel" Then
+        objIE.Quit
+        objLogger.Error(PASSWORD_CANCEL)
+        Call MsgBox(_
+            PASSWORD_CANCEL & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            CANCEL _
+       )
+    ElseIf loopcnt > MAXLOOPCNT And Not param = "OK" Then
+        objIE.Quit
+        objLogger.Error(PASSWORD_TIMEOUT)
+        Call MsgBox(_
+            PASSWORD_TIMEOUT & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            TIMEOUT_MESSAGE_2 _
+       )
+    ElseIf err.number <> 0 And Not objIE.Document.getElementById("watch").value = "OK" Then
+        objIE.Quit
+        objLogger.Error(UNFORESEEN_ERROR)
+        Call MsgBox(_
+            UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            ERROR_TITLE _
+       )
+    Else
+        InputPassword = objIE.Document.getElementById("userPass").value
+        objIE.Quit
+    End If
+
+    Set objIE = Nothing
+    Set objLogger = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : CreateResult
+'
+' Parameter    : Result of Application request
+'
+' Return Value : Result confirmation file
+'
+' Description  : Create a file which tells the Application request successfully ended or not
+'
+'*************************************************************************
+Sub CreateResult(result)
+    On Error Resume Next
+    Dim objFso, oTs
+    Dim message
+    
+    Set objFso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not objFso.FolderExists(TEMP_FOLDER) Then
+        objFso.CreateFolder(TEMP_FOLDER)
+    End If
+    
+    message = " "
+    If result Then
+        message = SUCCESS
+    End If
+    
+    Set oTs = objFso.CreateTextFile(TEMP_FOLDER & "\" & ENTRY_REQUEST_RESULT,True)
+    oTs.WriteLine message
+    oTs.Close
+    
+    set oTs=Nothing
+    Set objFso=Nothing
+End Sub
+
+'*************************************************************************
+' Function Id  : CheckResult
+'
+' Parameter    : 
+'
+' Return Value : Result of checking "Result confirmation file"
+'
+' Description  : Check the "Result confirmation file"
+'                to find the Application request succeeded or failed
+'
+'*************************************************************************
+Function CheckResult()
+    On Error Resume Next
+    Dim objFso, f
+    Dim objLogger
+    Dim fileName
+    
+    fileName = TEMP_FOLDER & "\" & ENTRY_REQUEST_RESULT
+
+    Set objLogger = GetCurrentLogger
+
+    Set objFso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not objFso.FileExists(fileName) Then
+        objLogger.Error(FormatMessage(NO_EXISTS_ERROR, Array(fileName)))
+        Call MsgBox(_
+            UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            ERROR_TITLE _
+        )
+        CheckResult = False
+        Set objLogger = Nothing
+        Set objFso = Nothing
+        Exit Function
+    End If
+
+    Set f = objFso.OpenTextFile(fileName, 1, True)
+    Dim readResult
+    readResult = f.ReadAll
+
+    If readResult = SUCCESS & Chr(13) & Chr(10) Then
+        objLogger.Info(CHECL_RESULT_SUCCESS)
+        CheckResult = True
+    Else
+        objLogger.Error(CHECK_RESULT_FAILED)
+        CheckResult = False
+    End If     
+    f.Close
+    Set objFso = Nothing
+
+    If Not DeleteTempFile(fileName) Then
+        objLogger.Error(FormatMessage(FILE_DELETE_ERROR, Array(fileName)))
+        Call MsgBox(_
+            UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            ERROR_TITLE _
+        )
+        CheckResult = False
+        Exit Function
+    End If
+
+    If Err.Number <> 0 Then
+        objLogger.Error(UNFORESEEN_ERROR)
+        Call MsgBox(_
+            UNFORESEEN_ERROR & ENTRY_REQUEST_INTTERRUPUTION, _
+            vbOKOnly + vbInformation + vbSystemModal, _
+            ERROR_TITLE _
+        )
+        CheckResult = False
+    End If
+
+    Set objLogger = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : DeleteTempFile
+'
+' Parameter    : File name
+'
+' Return Value : Result of deletion
+'
+' Description  : Delete the file
+'
+'*************************************************************************
+Function DeleteTempFile(fileName)
+    On Error Resume Next
+    Dim objFso
+    Set objFso = CreateObject("Scripting.FileSystemObject")
+    objFso.DeleteFile fileName
+
+    DeleteTempFile = True
+
+    If objFso.FileExists(fileName) Then
+        DeleteTempFile = False
+    End If
+
+    If Err.Number <> 0 Then
+        DeleteTempFile = False
+    End If
+
+    Set objFso = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : StringToBinary
+'
+' Parameter    : Texts
+'
+' Return Value : Binary converted from the texts
+'
+' Description  : Convert the parameter texts into binary
+'
+'*************************************************************************
+Function StringToBinary(Text)
+    On Error Resume Next
+	Const adTypeText = 2
+	Const adTypeBinary = 1
+
+	Dim BinaryStream 'As New Stream
+	Set BinaryStream = CreateObject("ADODB.Stream")
+
+	BinaryStream.Type = adTypeText
+	BinaryStream.CharSet = "us-ascii"
+
+	BinaryStream.Open
+	BinaryStream.WriteText Text
+
+	BinaryStream.Position = 0
+	BinaryStream.Type = adTypeBinary
+
+	BinaryStream.Position = 0
+
+	StringToBinary = BinaryStream.Read
+End Function
+
+
+'*************************************************************************
+' Function Id  : Wait
+'
+' Parameter    : IE object, elapsed time
+'
+' Return Value : 
+'
+' Description  : Wait until finish of process in current screen
+'
+'*************************************************************************
+Sub Wait(objIE, loopcnt)
+    On Error Resume Next
+    Do Until objIE.Busy = false And objIE.readyState = 4
+      WScript.sleep(MONITORING_TIME)
+      loopcnt = loopcnt + CInt(MONITORING_TIME)
+      If err.number <> 0 Or loopcnt > MAXLOOPCNT Then
+          Exit Do
+      End If
+    Loop
+End Sub
+
+'*************************************************************************
+' Function Id  : GetUser
+'
+' Parameter    : 
+'
+' Return Value : Account name
+'
+' Description  : Get the user's account name
+'
+'*************************************************************************
+Function GetUser()
+    On Error Resume Next
+    Dim strCmd, WshShell, outExec, result, StdOut, endIndex, user
+
+    strCmd = "query user"
+
+    Set WshShell = CreateObject("WScript.Shell") 
+    Set outExec = WshShell.Exec(strCmd)
+    Set StdOut = outExec.StdOut
+
+    Do While Not StdOut.AtEndOfStream
+       result = StdOut.ReadLine()
+       If InStr(result,"Active") > 0 Then
+           Exit Do 
+       End If
+    Loop
+
+    endIndex = InStr(2,result," ")
+
+    user = Mid(result, 2, endIndex-2)
+    
+    If Err.Number = 0 Then
+           GetUser = user
+    End If
+
+    Set WshShell = Nothing
+    Set outExec = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : GetSessionId
+'
+' Parameter    : Account name
+'
+' Return Value : Session ID
+'
+' Description  : Get the session ID of the account
+'
+'*************************************************************************
+Function GetSessionId(user)
+    On Error Resume Next
+    Dim strCmd, WshShell, outExec, result, StdOut, sessionId
+
+    strCmd = "query session"
+
+    Set WshShell = CreateObject("WScript.Shell") 
+    Set outExec = WshShell.Exec(strCmd)
+    Set StdOut = outExec.StdOut
+
+    Do While Not StdOut.AtEndOfStream
+       result = StdOut.ReadLine()
+       Dim userStartIndex, userEndIndex
+       userStartIndex = InStr(result, user)
+       If userStartIndex > 0 Then
+            userEndIndex = InStr(userStartIndex, result, " ")
+            result = Mid(result, userEndIndex)
+            Exit Do 
+       End if
+    Loop
+
+    Dim re, mc, startIndex, endIndex
+    Set re = createObject("VBScript.RegExp")
+    re.pattern = "\d"
+    Set mc = re.execute(CStr(result))
+    startIndex = mc.item(0).firstindex
+
+    endIndex = InStr(startIndex+1, result, " ")
+    
+    sessionId = Mid(result, startIndex+1, endIndex-startIndex)
+    
+    If Err.Number = 0 Then
+            GetSessionId = sessionId
+    End If
+
+    Set WshShell = Nothing
+    Set outExec = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : GetGroupCode
+'
+' Parameter    : 
+'
+' Return Value : Group code
+'
+' Description  : Get the group code of the Astellas laptop
+'
+'*************************************************************************
+Function GetGroupCode()
+    On Error Resume Next
+ 
+    Dim objWshShell
+    Set objWshShell = CreateObject("WScript.Shell")
+    
+    Dim SystemEnv
+    Set SystemEnv = objWshShell.Environment("SYSTEM")
+    
+    DIM objNW
+    Set objNW = CreateObject("WScript.Network")
+    
+    If Err.Number = 0 Then
+        GetGroupCode = SystemEnv("GROUPCODE")
+    End If
+    Set objWshShell = Nothing
+End Function
+
+'*************************************************************************
+' Function Id  : ActiveIE
+'
+' Parameter    : 
+'
+' Return Value : 
+'
+' Description  : Bring IE to front
+'
+'*************************************************************************
+Sub ActiveIE()
+    On Error Resume Next
+    Dim objWshShell
+    Dim intProcID
+
+    intProcID = GetProcID("iexplore.exe")
+    Set objWshShell = CreateObject("Wscript.Shell")
+    objWshShell.AppActivate intProcID
+    Set objWshShell = Nothing
+End Sub
+
+'*************************************************************************
+' Function Id  : GetProcID
+'
+' Parameter    : Process name
+'
+' Return Value : 
+'
+' Description  : Get process ID from the process name
+'
+'*************************************************************************
+Function GetProcID(ProcessName)
+    On Error Resume Next
+    Dim Service
+    Dim QfeSet
+    Dim Qfe
+    Dim intProcID
+
+    Set Service = WScript.CreateObject("WbemScripting.SWbemLocator").ConnectServer
+    Set QfeSet = Service.ExecQuery("Select * From Win32_Process Where Caption='"& ProcessName &"'")
+
+    intProcID = 0
+
+    For Each Qfe in QfeSet
+        intProcID = Qfe.ProcessId
+    Next
+    
+    If Err.Number = 0 Then
+        GetProcID = intProcID
+    End If
+End Function
+'*************************************************************************
+' Function Id  : CreateFolder2
+'
+' Parameter    : folder path
+'
+' Return Value : N/A
+'
+' Description  : Create a folder in path specified by the paramater
+'                It is capable of createing deeper layer path
+'                unlike folder creation function in Scripting.FileSystemObject
+'*************************************************************************
+Sub CreateFolder2(folder)
+
+    Dim strParentFolder
+
+    strParentFolder = _
+        objFS.GetParentFolderName(objFS.GetAbsolutePathName(folder))
+
+    If Not objFS.FolderExists(strParentFolder) Then
+
+        CreateFolder2 strParentFolder
+
+    End If
+
+    objFS.CreateFolder(folder)
+
+End Sub
+'*************************************************************************
+' Function Id  : FormatMessage
+'
+' Parameter    : msg Message template
+'                msgArgs Parameter array for replacing placeholder
+'
+' Return Value : Finalized message texts
+'
+' Description  : Generate message texts using template
+'                Applying the rules below to template to generate message
+'
+'                    "\"     -> "vbCrLf(linefeed code)"
+'                    "{i}"   -> text of corresponding index in parameter arry
+'                    ("i" is sequential number starting with 0)
+'
+'*************************************************************************
+Function FormatMessage(msg, msgArgs)
+    Dim i
+    Dim strPlaceHolder
+    Dim strMsgArg
+
+    If IsNull(msg) Then
+        msg = ""
+    End If
+
+    If IsNull(msgArgs) Then
+        msgArgs = Array()
+    End If
+
+    msg = Replace(msg, "\", vbCrLf)
+
+    i = 0
+    Do
+        strPlaceHolder = "{" & i & "}"
+        If Instr(1, msg, strPlaceHolder) = 0 Then
+            Exit Do
+        End If
+        If i <= Ubound(msgArgs) Then
+            If Not IsNull(msgArgs(i)) Then
+                strMsgArg = msgArgs(i)
+            Else
+                strMsgArg = "Null"
+            End If
+            msg = Replace(msg, strPlaceHolder, strMsgArg)
+        End If
+        i = i + 1
+    Loop
+    FormatMessage = msg
+End Function
+    </script>
+</job>
+
